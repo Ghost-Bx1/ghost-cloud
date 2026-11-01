@@ -28,6 +28,7 @@ Autor: By Gh0st-Bx1 | github.com/Ghost-Bx1
 
 import argparse
 import json
+import os
 import re
 import socket
 import ssl
@@ -455,7 +456,6 @@ def _print_summary(all_findings: dict):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    print(BANNER)
 
     ap = argparse.ArgumentParser(
         description="Ghost-Cloud - Cloud Security Assessment",
@@ -476,10 +476,19 @@ def main():
     ap.add_argument("--output", "-o", metavar="FILE", help="Salvar JSON em arquivo")
     ap.add_argument("--timeout", type=int, default=10, help="Timeout HTTP (padrao: 10s)")
     ap.add_argument("--no-ssl-verify", action="store_true", help="Desabilitar verificacao SSL")
+    ap.add_argument("--proxy", help="Proxy HTTP/HTTPS (ex: http://127.0.0.1:8080)")
+    ap.add_argument("--no-banner", action="store_true", help="Suprimir banner")
     args = ap.parse_args()
 
     global TIMEOUT
     TIMEOUT = args.timeout
+
+    if not getattr(args, "no_banner", False):
+        print(BANNER)
+
+    if getattr(args, "proxy", None):
+        os.environ["http_proxy"] = args.proxy
+        os.environ["https_proxy"] = args.proxy
 
     if not args.target and not args.bucket:
         ap.print_help()
