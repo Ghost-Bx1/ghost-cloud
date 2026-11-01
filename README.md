@@ -1,63 +1,111 @@
-# ghost-cloud
+# Ghost-Cloud
 
-**AWS / Azure / GCP Misconfiguration Scanner**
+> Cloud misconfiguration scanner for AWS, Azure, and GCP.
 
-By Gh0st-Bx1 | github.com/Ghost-Bx1
+```
+  GHOST-CLOUD  v1.0.0  |  Cloud Security Misconfiguration Scanner
+  By Gh0st-Bx1         |  github.com/Ghost-Bx1
+```
+
+![Python](https://img.shields.io/badge/Python-3.6%2B-blue?style=flat-square)
+![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows-lightgrey?style=flat-square)
+![Category](https://img.shields.io/badge/Category-Cloud%20Security-orange?style=flat-square)
 
 ---
 
-## Description
+## Overview
 
-ghost-cloud identifies cloud misconfigurations across AWS, Azure, and GCP. It checks for publicly accessible storage buckets, exposed container registries, IMDS metadata endpoints, and leaked IaC files (terraform.tfstate, .env, AWS credentials).
+Ghost-Cloud identifies misconfigurations across the three major cloud providers. It checks for publicly accessible storage buckets, exposed container registries, IMDS metadata endpoints, and leaked IaC files.
+
+| Module      | Description                                                         |
+|-------------|---------------------------------------------------------------------|
+| `--aws`     | S3 public bucket enumeration, ECR public registry                   |
+| `--azure`   | Blob container access, SAS token leaks, ACR public access          |
+| `--gcp`     | GCS bucket enumeration, GCR registry, service account key files     |
+| `--imds`    | IMDSv1/v2 metadata access and IAM role extraction                  |
+| `--registry`| Container registry checks across providers                          |
+| `--iac`     | IaC file exposure: .env, terraform.tfstate, .aws/credentials       |
+| `--all`     | Run all modules                                                     |
+
+---
+
+## Requirements
+
+```
+Python 3.6+
+No external dependencies (stdlib only)
+```
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/Ghost-Bx1/ghost-cloud
+cd ghost-cloud
+python ghost-cloud.py --help
+```
+
+---
 
 ## Usage
 
-```
+```bash
+# Run all checks against a domain
 python ghost-cloud.py --target example.com --all
+
+# AWS and IaC checks only
 python ghost-cloud.py --target example.com --aws --iac
+
+# Azure checks
 python ghost-cloud.py --target example.com --azure
+
+# GCP checks
 python ghost-cloud.py --target example.com --gcp
+
+# IMDS metadata endpoint check
 python ghost-cloud.py --ip 169.254.169.254 --imds
+
+# Check a specific S3/GCS bucket by name
 python ghost-cloud.py --bucket my-bucket-name --aws
+
+# Full scan with JSON output
 python ghost-cloud.py --target example.com --all -o results.json
 ```
 
-## Options
+### Chaining with ghost-report
 
-| Flag | Description |
-|------|-------------|
-| `--target` / `-t` | Target domain |
-| `--bucket` | Specific S3/GCS bucket name |
-| `--ip` | IP for IMDS check |
-| `--aws` | AWS checks (S3, ECR) |
-| `--azure` | Azure checks (Blob, ACR, SAS) |
-| `--gcp` | GCP checks (GCS, GCR, SA keys) |
-| `--imds` | IMDS metadata endpoint check |
-| `--registry` | Container registry checks |
-| `--iac` | IaC file leaks (.env, tfstate, credentials) |
-| `--all` / `-a` | Run all modules |
-| `--output` / `-o` | Save results as JSON |
-| `--timeout` | HTTP timeout in seconds (default: 10) |
-| `--no-ssl-verify` | Disable SSL verification |
-
-## Output
-
-JSON output follows the ghost-report schema and can be fed directly to ghost-report:
-
-```
+```bash
 python ghost-cloud.py -t example.com --all -o cloud.json
 python ghost-report.py --input cloud.json --output report.html
 ```
 
-## Checks Performed
+---
 
-- **AWS**: S3 public bucket enumeration, ECR public registry
-- **Azure**: Blob container access, SAS token leaks, ACR public access
-- **GCP**: GCS bucket enumeration, GCR registry, service account key files
-- **IMDS**: IMDSv1/v2 metadata access, IAM role extraction
-- **IaC**: `.env`, `terraform.tfstate`, `.aws/credentials`, `docker-compose.yml` exposure
+## Reference
 
-## Requirements
+| Flag                | Description                                      |
+|---------------------|--------------------------------------------------|
+| `--target / -t`     | Target domain                                    |
+| `--bucket`          | Specific S3/GCS bucket name to check             |
+| `--ip`              | IP address for IMDS check                        |
+| `--aws`             | AWS checks (S3, ECR)                             |
+| `--azure`           | Azure checks (Blob, ACR, SAS)                    |
+| `--gcp`             | GCP checks (GCS, GCR, service account keys)      |
+| `--imds`            | IMDS metadata endpoint check                     |
+| `--registry`        | Container registry checks                        |
+| `--iac`             | IaC file leak detection                          |
+| `--all / -a`        | Run all modules                                  |
+| `--output / -o`     | Save results as JSON                             |
+| `--timeout`         | HTTP timeout in seconds (default: 10)            |
+| `--no-ssl-verify`   | Disable SSL certificate verification             |
 
-- Python 3.6+
-- No external dependencies (stdlib only)
+---
+
+## Disclaimer
+
+For use in authorized environments only. Penetration testing, CTF competitions, and offensive security research with explicit permission from the environment owner. The author is not responsible for misuse.
+
+---
+
+**By [Gh0st-Bx1](https://github.com/Ghost-Bx1)**
