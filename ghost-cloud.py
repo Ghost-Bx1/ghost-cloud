@@ -46,7 +46,7 @@ try:
 except ImportError:
     REQUESTS_OK = False
 
-VERSAO = "1.0.0"
+VERSAO = "2.0.0"
 
 
 def _build_banner():
@@ -435,6 +435,147 @@ def check_iac_leaks(domain: str) -> list:
     return findings
 
 
+# ─── Elasticsearch / OpenSearch ──────────────────────────────────────────────
+
+def check_elasticsearch(domain: str) -> list:
+    """Verifica Elasticsearch/OpenSearch sem autenticacao."""
+    findings = []
+    for port, scheme in [(9200, "http"), (9243, "https"), (443, "https")]:
+        url = f"{scheme}://{domain}:{port}/"
+        status, _, body = _get(url, timeout=5)
+        if status == 200 and ('"cluster_name"' in body or '"version"' in body):
+            entry = {"url": url, "body": body[:300], "severity": "critical"}
+            idx_url = f"{scheme}://{domain}:{port}/_cat/indices?v"
+            s2, _, b2 = _get(idx_url, timeout=5)
+            if s2 == 200:
+                entry["indices"] = b2[:500]
+                _log("ES", f"[INDICES] {b2[:200]}", "Y")
+            findings.append(entry)
+            _log("ES", f"[EXPOSTO] Elasticsearch sem auth em {url}", "R")
+            break
+    return findings
+
+
+# ─── Firebase ─────────────────────────────────────────────────────────────────
+
+def check_firebase(domain: str) -> list:
+    """Verifica Firebase Realtime Database exposto."""
+    findings = []
+    base = domain.split(".")[0]
+    if base in ("www", "api", "app", "web"):
+        parts = domain.split(".")
+        base = parts[1] if len(parts) > 2 else parts[0]
+    for proj in [base, domain.replace(".", "-"),
+                 f"{base}-default-rtdb"]:
+        for fb_host in [f"{proj}.firebaseio.com",
+                        f"{proj}-default-rtdb.firebaseio.com"]:
+            url = f"https://{fb_host}/.json"
+            status, _, body = _get(url, timeout=5)
+            if status == 200 and body not in ("null", ""):
+                findings.append({"url": url, "body": body[:300], "severity": "critical"})
+                _log("Firebase", f"[EXPOSTO] DB publico: {url}", "R")
+            elif status == 200:
+                findings.append({"url": url, "note": "Acessivel mas vazio", "severity": "medium"})
+                _log("Firebase", f"[VAZIO] {url}", "Y")
+    return findings
+
+
+# ─── Kubernetes ───────────────────────────────────────────────────────────────
+
+def check_k8s_anon(domain: str) -> list:
+    """Verifica API Kubernetes com acesso anonimo."""
+    findings = []
+    for port, scheme in [(6443, "https"), (8443, "https"), (8080, "http"), (443, "https")]:
+        base_url = f"{scheme}://{domain}:{port}"
+        status, _, body = _get(f"{base_url}/version", verify=False, timeout=4)
+        if status == 200 and '"major"' in body:
+            _log("K8s", f"[DETECTADO] API server em {base_url}", "Y")
+            for path in ["/api/v1/namespaces", "/api/v1/pods",
+                         "/api/v1/secrets", "/apis/apps/v1/deployments"]:
+                s, _, b = _get(f"{base_url}{path}", verify=False, timeout=4)
+                if s == 200 and '"items"' in b:
+                    findings.append({
+                        "url": f"{base_url}{path}",
+                        "severity": "critical",
+                        "note": f"Acesso anonimo: {path}"
+                    })
+                    _log("K8s", f"[CRITICO] Acesso anonimo: {path}", "R")
+            break
+    return findings
+
+
+# ─── S3 sensitive files ───────────────────────────────────────────────────────
+
+_SENSITIVE_PATS = [".env", ".pem", ".key", "id_rsa", "id_dsa",
+                   "terraform.tfstate", ".p12", ".pfx",
+                   "credentials", "secret", "password", ".htpasswd"]
+
+
+def check_s3_sensitive_files(s3_findings: list) -> list:
+    """Verifica arquivos sensiveis em buckets S3 publicos listados."""
+    extra = []
+    for r in s3_findings:
+        if not r.get("listable") or not r.get("files"):
+            continue
+        url_base = r.get("url", "").rstrip("/")
+        for fname in r["files"]:
+            if any(pat in fname.lower() for pat in _SENSITIVE_PATS):
+                file_url = f"{url_base}/{fname}"
+                status, _, body = _get(file_url, timeout=5)
+                if status == 200:
+                    extra.append({
+                        "url": file_url, "file": fname,
+                        "size": len(body), "severity": "critical",
+                        "snippet": body[:200]
+                    })
+                    _log("S3", f"[ARQUIVO SENSIVEL] {file_url}", "R")
+    return extra
+
+
+# ─── EC2 user-data ────────────────────────────────────────────────────────────
+
+def check_ec2_user_data(ip: str = "169.254.169.254") -> dict:
+    """Verifica user-data EC2 para segredos expostos via IMDS."""
+    result = {"reachable": False, "has_secrets": False, "data": None}
+    status, _, body = _get(f"http://{ip}/latest/user-data", timeout=3)
+    if status == 200 and body.strip():
+        result["reachable"] = True
+        result["data"] = body[:500]
+        secret_pats = [
+            re.compile(r"AKIA[0-9A-Z]{16}", re.I),
+            re.compile(r"password\s*[=:]\s*\S+", re.I),
+            re.compile(r"secret\s*[=:]\s*\S+", re.I),
+            re.compile(r"token\s*[=:]\s*\S+", re.I),
+        ]
+        result["has_secrets"] = any(p.search(body) for p in secret_pats)
+        if result["has_secrets"]:
+            _log("IMDS", "[CRITICO] Segredos em user-data EC2", "R")
+        else:
+            _log("IMDS", f"[INFO] user-data acessivel ({len(body)}b)", "Y")
+    return result
+
+
+# ─── SQS enumeration ─────────────────────────────────────────────────────────
+
+def check_sqs_public(domain: str) -> list:
+    """Detecta filas SQS e orienta testes de acesso publico."""
+    findings = []
+    checked = set()
+    for region in ["us-east-1", "us-east-2", "us-west-2", "eu-west-1"]:
+        url = f"https://sqs.{region}.amazonaws.com/"
+        status, _, _ = _get(url, timeout=4)
+        if status in (400, 403, 404) and region not in checked:
+            checked.add(region)
+            findings.append({
+                "region": region,
+                "severity": "info",
+                "note": (f"SQS ativo em {region} - "
+                         f"testar: aws sqs list-queues --region {region}")
+            })
+            _log("SQS", f"SQS endpoint ativo em {region}", "D")
+    return findings
+
+
 # ─── Relatorio ────────────────────────────────────────────────────────────────
 
 def _print_summary(all_findings: dict):
@@ -472,6 +613,12 @@ def main():
     ap.add_argument("--imds", action="store_true", help="IMDS metadata check")
     ap.add_argument("--registry", action="store_true", help="Container registry checks")
     ap.add_argument("--iac", action="store_true", help="Terraform/CF/IaC leak checks")
+    ap.add_argument("--elasticsearch", "--es", action="store_true",
+                    help="Elasticsearch/OpenSearch sem auth")
+    ap.add_argument("--firebase", action="store_true",
+                    help="Firebase Realtime Database exposto")
+    ap.add_argument("--k8s", action="store_true",
+                    help="Kubernetes API sem autenticacao")
     ap.add_argument("--all", action="store_true", help="Executar todos os modulos")
     ap.add_argument("--output", "-o", metavar="FILE", help="Salvar JSON em arquivo")
     ap.add_argument("--timeout", type=int, default=10, help="Timeout HTTP (padrao: 10s)")
@@ -508,13 +655,19 @@ def main():
     if target:
         if run_all or args.aws:
             _log("AWS", f"Iniciando checks AWS para {target}", "C")
-            all_findings["s3"] = enum_s3_buckets(target)
+            s3_res = enum_s3_buckets(target)
+            all_findings["s3"] = s3_res
+            all_findings["s3_sensitive"] = check_s3_sensitive_files(s3_res)
             all_findings["ecr"] = check_ecr_public(target)
             all_findings["cloudformation"] = check_cloudformation_leaks(target)
+            all_findings["sqs"] = check_sqs_public(target)
 
         if run_all or args.imds:
             _log("IMDS", f"Verificando IMDS em {args.ip}", "C")
             all_findings["imds"] = [check_aws_metadata(args.ip)]
+            ud = check_ec2_user_data(args.ip)
+            if ud.get("reachable"):
+                all_findings["ec2_user_data"] = [ud]
 
         if run_all or args.azure:
             _log("Azure", f"Iniciando checks Azure para {target}", "C")
@@ -531,6 +684,18 @@ def main():
         if run_all or args.iac:
             _log("IaC", f"Verificando leaks de IaC em {target}", "C")
             all_findings["iac"] = check_iac_leaks(target)
+
+        if run_all or getattr(args, "elasticsearch", False):
+            _log("ES", f"Verificando Elasticsearch em {target}", "C")
+            all_findings["elasticsearch"] = check_elasticsearch(target)
+
+        if run_all or getattr(args, "firebase", False):
+            _log("Firebase", f"Verificando Firebase para {target}", "C")
+            all_findings["firebase"] = check_firebase(target)
+
+        if run_all or getattr(args, "k8s", False):
+            _log("K8s", f"Verificando Kubernetes API em {target}", "C")
+            all_findings["k8s"] = check_k8s_anon(target)
 
     _print_summary(all_findings)
 
