@@ -46,7 +46,7 @@ try:
 except ImportError:
     REQUESTS_OK = False
 
-VERSAO = "2.0.0"
+VERSAO = "2.1.0"
 
 
 def _build_banner():
@@ -576,6 +576,247 @@ def check_sqs_public(domain: str) -> list:
     return findings
 
 
+# ─── AWS API Checks (boto3) ───────────────────────────────────────────────────
+
+def check_lambda_env_leaks(domain: str, region: str = "us-east-1",
+                            aws_key: str = None, aws_secret: str = None) -> list:
+    """Detecta variaveis de ambiente sensiveis em funcoes Lambda."""
+    findings = []
+    _log("Lambda", "Verificando env vars de funcoes Lambda...", "C")
+    try:
+        import boto3
+        kwargs = {"region_name": region}
+        if aws_key and aws_secret:
+            kwargs["aws_access_key_id"] = aws_key
+            kwargs["aws_secret_access_key"] = aws_secret
+        client = boto3.client("lambda", **kwargs)
+        paginator = client.get_paginator("list_functions")
+        secret_patterns = ["password", "passwd", "secret", "token", "key", "api_key",
+                           "access_key", "private", "credentials", "auth"]
+        for page in paginator.paginate():
+            for fn in page.get("Functions", []):
+                name = fn.get("FunctionName", "")
+                env = fn.get("Environment", {}).get("Variables", {})
+                for var, val in env.items():
+                    for pat in secret_patterns:
+                        if pat in var.lower():
+                            findings.append({
+                                "function": name,
+                                "variable": var,
+                                "value_preview": val[:20] + "..." if len(val) > 20 else val,
+                                "severity": "critical",
+                                "note": "Variavel de ambiente sensivel em Lambda"
+                            })
+                            _log("Lambda", f"LEAK: {name} -> {var}", "C")
+                            break
+    except ImportError:
+        findings.append({
+            "note": "boto3 nao instalado - pip install boto3",
+            "severity": "info",
+            "dica": f"aws lambda list-functions --region {region} --query "
+                    "'Functions[].Environment.Variables'"
+        })
+        _log("Lambda", "boto3 nao disponivel", "W")
+    except Exception as e:
+        _log("Lambda", f"Erro: {e}", "W")
+    return findings
+
+
+def check_iam_policy_wildcard(domain: str, region: str = "us-east-1",
+                               aws_key: str = None, aws_secret: str = None) -> list:
+    """Detecta policies IAM com wildcards perigosos (Action:* ou Resource:*)."""
+    findings = []
+    _log("IAM", "Verificando policies IAM com wildcards...", "C")
+    try:
+        import boto3
+        import json as _json
+        kwargs = {"region_name": region}
+        if aws_key and aws_secret:
+            kwargs["aws_access_key_id"] = aws_key
+            kwargs["aws_secret_access_key"] = aws_secret
+        client = boto3.client("iam", **kwargs)
+        paginator = client.get_paginator("list_policies")
+        for page in paginator.paginate(Scope="Local"):
+            for policy in page.get("Policies", []):
+                pol_arn = policy["Arn"]
+                pol_ver = policy.get("DefaultVersionId", "v1")
+                try:
+                    doc = client.get_policy_version(
+                        PolicyArn=pol_arn, VersionId=pol_ver
+                    )["PolicyVersion"]["Document"]
+                    stmts = doc.get("Statement", [])
+                    if isinstance(stmts, dict):
+                        stmts = [stmts]
+                    for stmt in stmts:
+                        actions = stmt.get("Action", [])
+                        resources = stmt.get("Resource", [])
+                        if isinstance(actions, str):
+                            actions = [actions]
+                        if isinstance(resources, str):
+                            resources = [resources]
+                        if "*" in actions or "*" in resources:
+                            findings.append({
+                                "policy_arn": pol_arn,
+                                "effect": stmt.get("Effect", ""),
+                                "action_wildcard": "*" in actions,
+                                "resource_wildcard": "*" in resources,
+                                "severity": "critical",
+                                "note": "Policy IAM com wildcard Action ou Resource"
+                            })
+                            _log("IAM", f"WILDCARD: {pol_arn}", "C")
+                except Exception:
+                    pass
+    except ImportError:
+        findings.append({
+            "note": "boto3 nao instalado - pip install boto3",
+            "severity": "info",
+            "dica": "aws iam list-policies --scope Local && aws iam get-policy-version ..."
+        })
+        _log("IAM", "boto3 nao disponivel", "W")
+    except Exception as e:
+        _log("IAM", f"Erro: {e}", "W")
+    return findings
+
+
+def check_cloudtrail_disabled(domain: str, region: str = "us-east-1",
+                               aws_key: str = None, aws_secret: str = None) -> list:
+    """Verifica se CloudTrail esta desabilitado em regioes AWS."""
+    findings = []
+    _log("CloudTrail", "Verificando status do CloudTrail...", "C")
+    regions_to_check = [region, "us-east-2", "us-west-2", "eu-west-1"]
+    try:
+        import boto3
+        for reg in regions_to_check:
+            try:
+                kwargs = {"region_name": reg}
+                if aws_key and aws_secret:
+                    kwargs["aws_access_key_id"] = aws_key
+                    kwargs["aws_secret_access_key"] = aws_secret
+                client = boto3.client("cloudtrail", **kwargs)
+                trails = client.describe_trails(includeShadowTrails=False).get("trailList", [])
+                if not trails:
+                    findings.append({
+                        "region": reg,
+                        "severity": "critical",
+                        "note": f"CloudTrail SEM trilhas configuradas em {reg}"
+                    })
+                    _log("CloudTrail", f"DESABILITADO em {reg}", "C")
+                else:
+                    for trail in trails:
+                        status = client.get_trail_status(Name=trail["TrailARN"])
+                        if not status.get("IsLogging"):
+                            findings.append({
+                                "region": reg,
+                                "trail": trail.get("Name"),
+                                "severity": "critical",
+                                "note": f"CloudTrail '{trail.get('Name')}' existe mas NAO esta logando em {reg}"
+                            })
+                            _log("CloudTrail", f"IsLogging=False: {trail.get('Name')}", "C")
+            except Exception:
+                pass
+    except ImportError:
+        findings.append({
+            "note": "boto3 nao instalado - pip install boto3",
+            "severity": "info",
+            "dica": "aws cloudtrail describe-trails && aws cloudtrail get-trail-status --name TRAIL"
+        })
+        _log("CloudTrail", "boto3 nao disponivel", "W")
+    except Exception as e:
+        _log("CloudTrail", f"Erro: {e}", "W")
+    return findings
+
+
+def check_ec2_imdsv1_enabled(domain: str, region: str = "us-east-1",
+                              aws_key: str = None, aws_secret: str = None) -> list:
+    """Detecta instancias EC2 com IMDSv1 habilitado (HttpTokens=optional)."""
+    findings = []
+    _log("EC2", "Verificando instancias com IMDSv1 habilitado...", "C")
+    try:
+        import boto3
+        kwargs = {"region_name": region}
+        if aws_key and aws_secret:
+            kwargs["aws_access_key_id"] = aws_key
+            kwargs["aws_secret_access_key"] = aws_secret
+        client = boto3.client("ec2", **kwargs)
+        paginator = client.get_paginator("describe_instances")
+        for page in paginator.paginate():
+            for reservation in page.get("Reservations", []):
+                for inst in reservation.get("Instances", []):
+                    inst_id = inst.get("InstanceId", "")
+                    state = inst.get("State", {}).get("Name", "")
+                    if state != "running":
+                        continue
+                    opts = inst.get("MetadataOptions", {})
+                    http_tokens = opts.get("HttpTokens", "optional")
+                    if http_tokens == "optional":
+                        findings.append({
+                            "instance_id": inst_id,
+                            "region": region,
+                            "http_tokens": http_tokens,
+                            "severity": "high",
+                            "note": f"EC2 {inst_id} com IMDSv1 habilitado (HttpTokens=optional) - SSRF -> credenciais AWS"
+                        })
+                        _log("EC2", f"IMDSv1: {inst_id}", "C")
+    except ImportError:
+        findings.append({
+            "note": "boto3 nao instalado - pip install boto3",
+            "severity": "info",
+            "dica": "aws ec2 describe-instances --query 'Reservations[].Instances[].{ID:InstanceId,IMDS:MetadataOptions}'"
+        })
+        _log("EC2", "boto3 nao disponivel", "W")
+    except Exception as e:
+        _log("EC2", f"Erro IMDSv1 check: {e}", "W")
+    return findings
+
+
+def check_sg_permissive(domain: str, region: str = "us-east-1",
+                         aws_key: str = None, aws_secret: str = None) -> list:
+    """Detecta Security Groups com 0.0.0.0/0 em portas sensiveis."""
+    findings = []
+    sensitive_ports = {22: "SSH", 3389: "RDP", 3306: "MySQL", 5432: "PostgreSQL",
+                       1433: "MSSQL", 27017: "MongoDB", 6379: "Redis", 9200: "Elasticsearch"}
+    _log("SG", "Verificando Security Groups permissivos...", "C")
+    try:
+        import boto3
+        kwargs = {"region_name": region}
+        if aws_key and aws_secret:
+            kwargs["aws_access_key_id"] = aws_key
+            kwargs["aws_secret_access_key"] = aws_secret
+        client = boto3.client("ec2", **kwargs)
+        paginator = client.get_paginator("describe_security_groups")
+        for page in paginator.paginate():
+            for sg in page.get("SecurityGroups", []):
+                sg_id = sg.get("GroupId", "")
+                sg_name = sg.get("GroupName", "")
+                for perm in sg.get("IpPermissions", []):
+                    from_port = perm.get("FromPort", 0)
+                    to_port = perm.get("ToPort", 65535)
+                    for cidr in perm.get("IpRanges", []):
+                        if cidr.get("CidrIp") in ("0.0.0.0/0", "::/0"):
+                            for port, svc in sensitive_ports.items():
+                                if from_port <= port <= to_port:
+                                    findings.append({
+                                        "sg_id": sg_id,
+                                        "sg_name": sg_name,
+                                        "port": port,
+                                        "service": svc,
+                                        "cidr": cidr.get("CidrIp"),
+                                        "severity": "critical",
+                                        "note": f"SG {sg_id}: porta {port}/{svc} aberta para {cidr.get('CidrIp')}"
+                                    })
+                                    _log("SG", f"OPEN: {sg_id} porta {port}/{svc}", "C")
+    except ImportError:
+        findings.append({
+            "note": "boto3 nao instalado - pip install boto3",
+            "severity": "info",
+            "dica": "aws ec2 describe-security-groups --query 'SecurityGroups[?IpPermissions[?IpRanges[?CidrIp==`0.0.0.0/0`]]]'"
+        })
+        _log("SG", "boto3 nao disponivel", "W")
+    except Exception as e:
+        _log("SG", f"Erro SG check: {e}", "W")
+    return findings
+
+
 # ─── Relatorio ────────────────────────────────────────────────────────────────
 
 def _print_summary(all_findings: dict):
@@ -620,6 +861,12 @@ def main():
     ap.add_argument("--k8s", action="store_true",
                     help="Kubernetes API sem autenticacao")
     ap.add_argument("--all", action="store_true", help="Executar todos os modulos")
+    ap.add_argument("--aws-api", action="store_true",
+                    help="Checks AWS via API boto3 (Lambda, IAM, CloudTrail, EC2 IMDSv1, SG)")
+    ap.add_argument("--aws-region", default="us-east-1", metavar="REGION",
+                    help="Regiao AWS para checks via API (padrao: us-east-1)")
+    ap.add_argument("--aws-key", metavar="KEY", help="AWS Access Key ID (opcional)")
+    ap.add_argument("--aws-secret", metavar="SECRET", help="AWS Secret Access Key (opcional)")
     ap.add_argument("--output", "-o", metavar="FILE", help="Salvar JSON em arquivo")
     ap.add_argument("--timeout", type=int, default=10, help="Timeout HTTP (padrao: 10s)")
     ap.add_argument("--no-ssl-verify", action="store_true", help="Desabilitar verificacao SSL")
@@ -696,6 +943,22 @@ def main():
         if run_all or getattr(args, "k8s", False):
             _log("K8s", f"Verificando Kubernetes API em {target}", "C")
             all_findings["k8s"] = check_k8s_anon(target)
+
+    aws_key = getattr(args, "aws_key", None)
+    aws_secret = getattr(args, "aws_secret", None)
+    aws_region = getattr(args, "aws_region", "us-east-1")
+    if run_all or getattr(args, "aws_api", False):
+        _log("AWS-API", f"Iniciando checks AWS via API (regiao: {aws_region})", "C")
+        all_findings["lambda_env"] = check_lambda_env_leaks(
+            target, region=aws_region, aws_key=aws_key, aws_secret=aws_secret)
+        all_findings["iam_wildcard"] = check_iam_policy_wildcard(
+            target, region=aws_region, aws_key=aws_key, aws_secret=aws_secret)
+        all_findings["cloudtrail"] = check_cloudtrail_disabled(
+            target, region=aws_region, aws_key=aws_key, aws_secret=aws_secret)
+        all_findings["ec2_imdsv1"] = check_ec2_imdsv1_enabled(
+            target, region=aws_region, aws_key=aws_key, aws_secret=aws_secret)
+        all_findings["sg_permissive"] = check_sg_permissive(
+            target, region=aws_region, aws_key=aws_key, aws_secret=aws_secret)
 
     _print_summary(all_findings)
 
