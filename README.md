@@ -102,6 +102,28 @@ python ghost-report.py --input cloud.json --output report.html
 
 ---
 
+## Roadmap
+
+Improvements planned based on analysis of Prowler, ScoutSuite and CloudSploit:
+
+| Priority | Feature | Description |
+|----------|---------|-------------|
+| High | Elasticsearch/OpenSearch detection | Probe `_cat/indices` on port 9200/443 without credentials - responsible for major public breaches |
+| High | Firebase misconfiguration | Probe `{project}.firebaseio.com/.json` and default RTDB endpoint unauthenticated |
+| High | Kubernetes module (`--k8s`) | Probe k8s API `/api/v1/namespaces` for anonymous-auth; common prefixes: eks, k8s, kubernetes, kube |
+| High | Secrets in public S3 objects | For found public buckets, enumerate keys matching `*.env`, `*.pem`, `id_rsa`, `terraform.tfstate` |
+| High | EC2 user-data secrets | Probe `169.254.169.254/latest/user-data` and IAM credentials path on IMDS |
+| High | SQS public queue enumeration | Test `ListQueues` and `ReceiveMessage` without credentials on discovered SQS URLs |
+| Medium | RDS public instance detection | DNS probe for publicly accessible RDS endpoints; port-check 3306/5432/1433 |
+| Medium | API Gateway authentication check | Enumerate `{id}.execute-api.{region}.amazonaws.com` subdomains; probe without Authorization |
+| Medium | CloudTrail log bucket check | Enumerate common bucket names (`{company}-cloudtrail`, `aws-cloudtrail-logs-{account}`) |
+| Medium | CIS Benchmark compliance scoring | Map each check to CIS AWS/Azure/GCP IDs; print pass/fail score at end (`--compliance cis-aws`) |
+| Medium | GitHub Actions OIDC misconfiguration | Detect `StringLike "*"` in AWS trust policies tied to GitHub OIDC |
+| Low | IAM overly permissive policy detection | Flag roles/users with `"Action": "*"` or `"Resource": "*"` |
+| Low | Azure SAS token search | Scan public paste sites and job postings for SAS tokens (`--sas-search`) |
+| Low | Compliance report output | Table format with Finding/Severity/CIS Control/Remediation URL (`--output-format compliance`) |
+| Low | Severity filter | `--severity critical,high` to surface only impactful findings |
+
 ## Disclaimer
 
 For use in authorized environments only. Penetration testing, CTF competitions, and offensive security research with explicit permission from the environment owner. The author is not responsible for misuse.
