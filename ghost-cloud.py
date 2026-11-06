@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Ghost-Cloud v1.0.0 - Cloud Security Assessment Framework
 =========================================================
