@@ -837,11 +837,52 @@ def _print_summary(all_findings: dict):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+_CLOUD_HELP = """\033[92mModulos por Provider:\033[0m
+  \033[1m--aws\033[0m              AWS: S3 buckets, ECR registries, IMDS metadata
+  \033[1m--azure\033[0m            Azure: Blob storage, ACR, SAS tokens, metadata
+  \033[1m--gcp\033[0m              GCP: GCS buckets, GCR, service account keys
+  \033[1m--imds\033[0m             IMDS: Roubo de credenciais via metadata endpoint
+  \033[1m--registry\033[0m         Container registries: acesso publico/anonimo
+  \033[1m--firebase\033[0m         Firebase: rules abertas, dados publicos
+  \033[1m--elasticsearch\033[0m    Elasticsearch: instancias sem auth expostas
+  \033[1m--k8s\033[0m              Kubernetes: API server, kubelet, etcd expostos
+  \033[1m--iac\033[0m              IaC leaks: Terraform state, CF templates publicos
+  \033[1m--aws-api\033[0m          AWS API calls com credenciais (IAM enum, S3 list)
+  \033[1m--all\033[0m              Executar todos os modulos
+
+\033[92mOpcoes:\033[0m
+  \033[1m-t / --target\033[0m      Dominio ou hostname alvo
+  \033[1m--bucket\033[0m           Nome exato de bucket para testar diretamente
+  \033[1m--ip\033[0m               IP do IMDS (padrao: 169.254.169.254)
+  \033[1m--aws-key\033[0m          AWS Access Key ID
+  \033[1m--aws-secret\033[0m       AWS Secret Access Key
+  \033[1m--aws-region\033[0m       Regiao AWS (padrao: us-east-1)
+  \033[1m--timeout\033[0m N         Timeout HTTP (padrao: 10s)
+  \033[1m--proxy\033[0m            Proxy HTTP/HTTPS
+  \033[1m--no-ssl-verify\033[0m    Desabilitar verificacao SSL
+  \033[1m--output\033[0m           Salvar resultados em JSON
+  \033[1m--no-banner\033[0m        Suprimir banner
+
+\033[92mExemplos:\033[0m
+  python ghost-cloud.py -t empresa.com --all
+  python ghost-cloud.py -t empresa.com --aws --s3 --imds
+  python ghost-cloud.py --bucket minha-empresa-backup --aws
+  python ghost-cloud.py -t empresa.com --azure --gcp --firebase
+  python ghost-cloud.py --imds --ip 169.254.169.254
+  python ghost-cloud.py -t empresa.com --k8s --elasticsearch
+  python ghost-cloud.py --aws-api --aws-key AKIA... --aws-secret ...
+
+\033[2mUse: python ghost-cloud.py --help  para ver todos os flags disponiveis\033[0m
+"""
+
+
 def main():
 
     ap = argparse.ArgumentParser(
-        description="Ghost-Cloud - Cloud Security Assessment",
-        formatter_class=argparse.RawTextHelpFormatter)
+        prog="ghost-cloud",
+        description="Ghost-Cloud v1.0.0 - Cloud Security Assessment  |  By Gh0st-Bx1",
+        epilog=_CLOUD_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-t", "--target", metavar="HOST",
                     help="Dominio ou hostname alvo")
     ap.add_argument("--bucket", metavar="BUCKET",
