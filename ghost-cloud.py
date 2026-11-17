@@ -1097,6 +1097,107 @@ def check_lambda_function_urls(domain: str) -> list:
     return findings
 
 
+# ─── ECS/Fargate Metadata ─────────────────────────────────────────────────────
+
+def check_ecs_metadata(ip: str = "169.254.170.2") -> dict:
+    """Verifica ECS/Fargate Task Metadata endpoint para roubo de credenciais IAM."""
+    result = {"reachable": False, "task_role_arn": None, "credentials": None}
+    _log("ECS", f"Verificando ECS Task Metadata em {ip}", "C")
+
+    # ECS task metadata v4 (Fargate and EC2)
+    task_meta_url = f"http://{ip}/v4/metadata"
+    creds_path_url = f"http://{ip}/v4/credentials"
+
+    # Try task metadata
+    st, _, body = _get(task_meta_url, timeout=4)
+    if st == 200 and ("TaskARN" in body or "Cluster" in body):
+        result["reachable"] = True
+        try:
+            import json as _j
+            data = _j.loads(body)
+            result["task_arn"] = data.get("TaskARN", "")
+            result["cluster"] = data.get("Cluster", "")
+            result["family"] = data.get("Family", "")
+            _log("ECS", f"[ECS] Task: {result['task_arn']} | Cluster: {result['cluster']}", "R")
+        except Exception:
+            result["raw_task"] = body[:200]
+
+    # Try credentials endpoint (AWS_CONTAINER_CREDENTIALS_RELATIVE_URI)
+    # Usually at http://169.254.170.2/RELATIVE_URI or http://ECS_AGENT/v2/credentials
+    creds_endpoints = [
+        f"http://{ip}/v4/credentials",
+        f"http://169.254.170.2/v2/credentials",
+        f"http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+    ]
+    for creds_url in creds_endpoints:
+        try:
+            st2, _, body2 = _get(creds_url, timeout=4)
+            if st2 == 200 and ("AccessKeyId" in body2 or "Token" in body2):
+                result["reachable"] = True
+                try:
+                    import json as _j
+                    creds = _j.loads(body2)
+                    result["credentials"] = {
+                        "access_key": creds.get("AccessKeyId", "")[:12] + "...",
+                        "secret_key": "REDACTED",
+                        "token": creds.get("Token", "")[:20] + "...",
+                        "expiration": creds.get("Expiration", ""),
+                        "role": creds.get("RoleArn", creds.get("Code", "")),
+                    }
+                    result["task_role_arn"] = creds.get("RoleArn", "")
+                    _log("ECS", "[CRITICO] Credenciais IAM do Task Role obtidas!", "R")
+                except Exception:
+                    result["raw_creds"] = body2[:200]
+                break
+        except Exception:
+            pass
+
+    return result
+
+
+# ─── Azure KeyVault Public Access ─────────────────────────────────────────────
+
+def check_azure_keyvault(domain: str) -> list:
+    """Verifica Azure KeyVault com acesso publico e secrets expostos."""
+    findings = []
+    # Enumerate likely KeyVault names from domain
+    base = domain.split(".")[0]
+    candidates = [
+        f"{base}-kv", f"{base}-keyvault", f"{base}-vault",
+        f"{base}-prod-kv", f"{base}-dev-kv", f"{base}-secrets",
+        f"kv-{base}", f"vault-{base}",
+    ]
+    for name in candidates:
+        url = f"https://{name}.vault.azure.net"
+        # Probe keys endpoint - 200/401/403 means vault exists
+        try:
+            st, headers, body = _get(f"{url}/keys?api-version=7.4", timeout=5)
+            if st in (200, 401, 403):
+                content = body[:300]
+                accessible = st == 200
+                _log("KEYVAULT", f"[AZURE] KeyVault encontrado: {url} [HTTP {st}]",
+                     "R" if accessible else "Y")
+                findings.append({
+                    "url": url, "type": "azure_keyvault",
+                    "public": accessible,
+                    "http_status": st,
+                    "detail": "KeyVault acessivel sem auth" if accessible else f"KeyVault existe (HTTP {st})",
+                    "evidence": content if accessible else "",
+                })
+                # Try to list secrets if public
+                if accessible:
+                    st2, _, body2 = _get(f"{url}/secrets?api-version=7.4", timeout=5)
+                    if st2 == 200 and "value" in body2:
+                        _log("KEYVAULT", "[CRITICO] Secrets listados sem autenticacao!", "R")
+                        findings[-1]["secrets_exposed"] = body2[:300]
+        except Exception:
+            pass
+
+    if not findings:
+        _log("KEYVAULT", f"Nenhum Azure KeyVault encontrado para: {domain}", "INFO")
+    return findings
+
+
 # ─── Relatorio ────────────────────────────────────────────────────────────────
 
 def _print_summary(all_findings: dict):
@@ -1131,6 +1232,8 @@ _CLOUD_HELP = """\033[92mModulos por Provider:\033[0m
   \033[1m--iac\033[0m              IaC leaks: Terraform state, CF templates, .env
   \033[1m--takeover\033[0m         Subdomain takeover via CNAME dangling (20+ servicos)
   \033[1m--cognito\033[0m          AWS Cognito: Identity Pools e User Pools expostos
+  \033[1m--ecs\033[0m              ECS/Fargate: Task Metadata - roubo de IAM Task Role credentials
+  \033[1m--keyvault\033[0m         Azure KeyVault: detectar vaults publicos e secrets expostos
   \033[1m--function-urls\033[0m    Lambda Function URLs sem autenticacao
   \033[1m--aws-api\033[0m          AWS API com credenciais: Lambda env, IAM, CloudTrail, SG
   \033[1m--all\033[0m              Executar todos os modulos
@@ -1200,6 +1303,10 @@ def main():
                     help="AWS Cognito: Identity Pools e User Pools expostos")
     ap.add_argument("--function-urls", action="store_true",
                     help="Lambda Function URLs sem autenticacao")
+    ap.add_argument("--ecs", action="store_true",
+                    help="ECS/Fargate Task Metadata: roubo de credenciais IAM do Task Role")
+    ap.add_argument("--keyvault", action="store_true",
+                    help="Azure KeyVault: detectar vaults com acesso publico")
     ap.add_argument("--aws-api", action="store_true",
                     help="Checks AWS via API boto3 (Lambda, IAM, CloudTrail, EC2 IMDSv1, SG)")
     ap.add_argument("--aws-region", default="us-east-1", metavar="REGION",
@@ -1302,6 +1409,15 @@ def main():
     if run_all or getattr(args, "gcp_metadata", False):
         _log("GCP-Meta", f"Verificando GCP Metadata em {args.ip}", "C")
         all_findings["gcp_metadata"] = [check_gcp_metadata(args.ip)]
+
+    if run_all or getattr(args, "ecs", False):
+        _log("ECS", f"Verificando ECS/Fargate Task Metadata em {args.ip}", "C")
+        all_findings["ecs_metadata"] = [check_ecs_metadata(getattr(args, "ip", "169.254.170.2"))]
+
+    if run_all or (hasattr(args, "keyvault") and args.keyvault):
+        if target:
+            _log("KeyVault", f"Verificando Azure KeyVault para {target}", "C")
+            all_findings["azure_keyvault"] = check_azure_keyvault(target)
 
     aws_key = getattr(args, "aws_key", None)
     aws_secret = getattr(args, "aws_secret", None)
